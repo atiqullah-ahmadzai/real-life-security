@@ -1,0 +1,13 @@
+.model
+.venv
+venv
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+dataset/
+Code/github/
+Code/data
+Code/w2v
+Code/model
