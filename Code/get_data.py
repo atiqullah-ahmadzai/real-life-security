@@ -2,28 +2,21 @@ import myutils
 import time
 import sys
 import json
-import subprocess
 from datetime import datetime
-import requests
-import pickle
-from pydriller import Repository
-
 
 def getChanges(rest):
-
-    ### extracts the changes from the pure .diff file
-    ### start by parsing the header of the diff
-
+    """
+    Extracts the changes from the raw diff file.
+    """
     changes = []
+    exts = [".c", ".cpp", ".cc"]
     while "diff --git" in rest:
-        filename = ""
         start = rest.find("diff --git") + 1
         secondpart = rest.find("index") + 1
-        # get the title line which contains the file name
-        titleline = rest[start:secondpart]
-        if not (".c") in rest[start:secondpart]:
-            # No python file changed in this part of the commit
-            rest = rest[secondpart + 1]
+        titleline = rest[start:secondpart]  # title line contains the filename info
+        # Check if the title line mentions a supported extension.
+        if not any(ext in titleline.lower() for ext in exts):
+            rest = rest[secondpart + 1:]
             continue
         if "diff --git" in rest[start:]:
             end = rest[start:].find("diff --git")
@@ -34,353 +27,161 @@ def getChanges(rest):
             filechange = rest[start:end]
             rest = ""
         filechangerest = filechange
-
         while "@@" in filechangerest:
-            ### extract all singular changes, which are recognizable by the @@ marking the line number
             change = ""
             start = filechangerest.find("@@") + 2
-            start2 = filechangerest[start : start + 50].find("@@") + 2
+            start2 = filechangerest[start:start+50].find("@@") + 2
             start = start + start2
             filechangerest = filechangerest[start:]
-
-            if (
-                "class" in filechangerest or "def" in filechangerest
-            ) and "\n" in filechangerest:
-                filechangerest = filechangerest[filechangerest.find("\n") :]
-
+            if ("class" in filechangerest or "def" in filechangerest) and "\n" in filechangerest:
+                filechangerest = filechangerest[filechangerest.find("\n"):]
             if "@@" in filechangerest:
                 end = filechangerest.find("@@")
                 change = filechangerest[:end]
-                filechangerest = filechangerest[end + 2 :]
-
+                filechangerest = filechangerest[end + 2:]
             else:
                 end = len(filechangerest)
                 change = filechangerest[:end]
                 filechangerest = ""
-
-            if len(change) > 0:
+            if change:
                 changes.append([titleline, change])
-
     return changes
 
-
 def getFilename(titleline):
-    # extracts the file name from the title line of a diff file
+    """
+    Extracts the filename from the title line of a diff file.
+    """
     s = titleline.find(" a/") + 2
     e = titleline.find(" b/")
     name = titleline[s:e]
-
+    exts = [".c", ".cpp", ".cc"]
     if titleline.count(name) == 2:
         return name
-    elif ".c" in name and (" a" + name + " " in titleline):
+    elif any(ext in name.lower() for ext in exts) and (" a" + name + " " in titleline):
         return name
     else:
-        print("couldn't find name")
-        print(titleline)
-        print(name)
-
+        print("Couldn't find name", titleline, name)
+        return None
 
 def makechangeobj(changething):
-    # for a single change, consisting of titleline and raw code, create a usable object by extracting all relevant info
-
+    """
+    For a single change (titleline and diff content), create an object with details.
+    """
     change = changething[1]
     titleline = changething[0]
-
-    if "<html" in change:
+    if "<html" in change or "sage:" in change or "sage :" in change:
         return None
-
-    if "sage:" in change or "sage :" in change:
-        return None
-
     thischange = {}
-
-    if myutils.getBadpart(change) is not None:
-        badparts = myutils.getBadpart(change)[0]
-        goodparts = myutils.getBadpart(change)[1]
-        linesadded = change.count("\n+")
-        linesremoved = change.count("\n-")
+    badpart_result = myutils.getBadpart(change)
+    if badpart_result is not None:
+        badparts, goodparts = badpart_result
         thischange["diff"] = change
-        thischange["add"] = linesadded
-        thischange["remove"] = linesremoved
+        thischange["add"] = change.count("\n+")
+        thischange["remove"] = change.count("\n-")
         thischange["filename"] = getFilename(titleline)
         thischange["badparts"] = badparts
-        thischange["goodparts"] = []
-        if goodparts is not None:
-            thischange["goodparts"] = goodparts
-        if thischange["filename"] is not None:
+        thischange["goodparts"] = goodparts if goodparts is not None else []
+        if thischange["filename"]:
             return thischange
-
     return None
 
-
 # ===========================================================================
-# main
+# Main processing
 
+# Load the commits from the JSON file.
+with open("github/c_commits_with_diffs_sample.json", "r") as infile:
+    raw_data = json.load(infile)
 
-# load list of all repositories and commits
-with open("github/clean_commits.json", "r") as infile:
-    data = json.load(infile)
+# Group commits by repository if the raw data is a list.
+if isinstance(raw_data, list):
+    grouped_data = {}
+    for commit in raw_data:
+        repo = commit.get("project", "unknown")
+        if repo not in grouped_data:
+            grouped_data[repo] = []
+        grouped_data[repo].append(commit)
+else:
+    grouped_data = raw_data  # assume already grouped
 
-now = datetime.now()  # current date and time
-nowformat = now.strftime("%H:%M")
-print("finished loading ", nowformat)
+now = datetime.now()
+print("Finished loading at", now.strftime("%H:%M"))
 
+# Set mode from command line (default "overflow")
+mode = "dos"
+# mode = "overflow"
+# mode = "info"
+# mode = "bypass"
+# mode = "priv"
 
-progress = 0
-changedict = {}
-
-
-# default is sql
-mode = "overflow"
 if len(sys.argv) > 1:
     mode = sys.argv[1]
 
+# Define filtering keywords.
+suspiciouswords = ["injection", "vulnerability", "exploit", " ctf",
+                   "capture the flag", "ctf", "burp", "capture", "flag", "attack", "hack"]
+badwords = ["overflow", "buffer", "stack", "heap", "format", "dos", "arbitrary", "injection"]
 
-for mode in ["overflow"]:
+# Build the final output: a dictionary mapping repo URLs to a dictionary mapping commit SHA to commit objects.
+final_data = {}
 
-    if mode == "overflow":
-        allowedKeywords = ["overflow", "buffer", "stack", "heap", "format"]
-    
-
-    # words that should not appear in the filename, because it's a sign that the file is actually part of a demo, a hacking tool or something like that
-    suspiciouswords = [
-        "injection",
-        "vulnerability",
-        "exploit",
-        " ctf",
-        "capture the flag",
-        "ctf",
-        "burp",
-        "capture",
-        "flag",
-        "attack",
-        "hack",
-    ]
-
-    # words that should not appear in the commit message
-    badwords = ["overflow", "buffer", "stack", "heap", "format"]
-
-    progress = 0
-    datanew = {}
-
-    for r in data:
-
-        progress = progress + 1
-
-        # check the repository name
-        suspicious = False
-        for b in badwords:
-            if b.lower() in r.lower():
-                suspicious = True
-        if suspicious:
+for repo, commit_list in grouped_data.items():
+    for commit_obj in commit_list:
+        # Filter commit: vulnerability field must contain the mode.
+        if "vulnerability" not in commit_obj or mode.lower() not in commit_obj["vulnerability"].lower():
+            continue
+        if "diff" not in commit_obj or not any(ext in commit_obj["diff"].lower() for ext in [".c", ".cpp", ".cc"]):
+            continue
+        if "message" not in commit_obj:
+            commit_obj["message"] = ""
+        if any(b.lower() in commit_obj["message"].lower() for b in badwords):
+            print("Skipping suspicious commit msg:", commit_obj["message"][:300])
             continue
 
-        changesfromdiff = False
-        all_irrelevant = True
+        changes = getChanges(commit_obj["diff"])
+        change_found = False
 
-        changeCommits = []
-        for c in data[r]:
+        # Ensure commit_obj["files"] is a dict.
+        if "files" not in commit_obj or not isinstance(commit_obj["files"], dict):
+            commit_obj["files"] = {}
 
-            irrelevant = True
-            for k in allowedKeywords:
-                if k.lower() in data[r][c]["keyword"].lower():
-                    # check if the keywords match with the ones we are looking for
-                    irrelevant = False
-
-            if irrelevant:
-                continue
-
-            if not (".c" in data[r][c]["diff"]):
-                # doesn't even contain a python file that was changed
-                continue
-
-            #  print("\n\n" + r + "/commit/" + c)
-            #  print("Keyword: " + data[r][c]["keyword"])
-
-            if not "message" in data[r][c]:
-                data[r][c]["message"] = ""
-
-            # put the commit in a list to check if we get too many duplicates of the same commit (due to forks etc.)
-            if not c in changedict:
-                changedict[c] = 0
-            if c in changedict:
-                changedict[c] = changedict[c] + 1
-                if changedict[c] > 5:
-                    # print(" we already have more than five. Skip.")
-                    continue
-            else:
-                changedict[c] = 1
-
-            badparts = {}
-
-            # get all changes that are written down in the diff file
-            changes = getChanges(data[r][c]["diff"])
-
-            for change in changes:
-
-                # make them into usable objects
-                thischange = makechangeobj(change)
-
-                if thischange is not None:
-                    if not "files" in data[r][c]:
-                        data[r][c]["files"] = {}
-                    f = thischange["filename"]
-
-                    if f is not None:
-
-                        # check the filename for hints that it is an implementation of an attack, a demonstration etc.
-                        suspicious = False
-                        for s in suspiciouswords:
-                            if s.lower() in f.lower():
-                                # words should not appear in the filename
-                                suspicious = True
-
-                        if not suspicious:
-                            if not f in data[r][c]["files"]:
-                                data[r][c]["files"][f] = {}
-                            if not "changes" in data[r][c]["files"][f]:
-                                data[r][c]["files"][f]["changes"] = []
-                            data[r][c]["files"][f]["changes"].append(thischange)
-                            changesfromdiff = True
-                            changeCommits.append(c)
-
-        if changesfromdiff:
-            # if any changes in this diff were useful...we get the sourcecode for those files using pydriller
-            print(
-                "\n\n"
-                + mode
-                + "    mining "
-                + r
-                + " "
-                + str(progress)
-                + "/"
-                + str(len(data))
-            )
-
-            commitlist = []
-            try:
-                for commit in Repository(r).traverse_commits():
-                    commitlist.append(commit.hash)
-
-                    # go through all commits in the repository mining and check if they match with one of the commits that are of interest
-                    if not commit.hash in changeCommits:
+        for change in changes:
+            thischange = makechangeobj(change)
+            if thischange is not None:
+                f = thischange["filename"]
+                if f is not None:
+                    if any(s.lower() in f.lower() for s in suspiciouswords):
                         continue
+                    if f not in commit_obj["files"]:
+                        commit_obj["files"][f] = {}
+                    if "changes" not in commit_obj["files"][f]:
+                        commit_obj["files"][f]["changes"] = []
+                    commit_obj["files"][f]["changes"].append(thischange)
+                    change_found = True
 
-                    for m in commit.modified_files:
-                        # run through all modifications in the single commit in the repository mining
-                        if m.old_path != None and m.source_code_before != None:
-                            if not ".c" in m.old_path:
-                                continue
-
-                            # ignore files that are too large
-                            if len(m.source_code_before) > 30000:
-                                continue
-
-                            # print("\n  modification with old path: " + str(m.old_path))
-                            for c in data[r]:
-                                if c == commit.hash:
-                                    # run through commits we have for that repository until the match is found
-                                    print("  found commit " + c)
-                                    if not "files" in data[r][c]:
-                                        print("  no files :(")  # rarely ever happens
-                                    data[r][c][
-                                        "msg"
-                                    ] = (
-                                        commit.msg
-                                    )  # get the commit message from the repository mining, check it for suspicious words
-                                    for badword in badwords:
-                                        if badword.lower() in commit.msg.lower():
-                                            suspicious = True
-                                    if suspicious:
-                                        print(
-                                            '  suspicious commit msg: "'
-                                            + commit.msg.replace("\n", " ")[:300]
-                                            + '..."'
-                                        )
-                                        continue
-
-                                    # print("  The commit has " + str(len(data[r][c]["files"])) + " files.")
-                                    for f in data[r][c]["files"]:
-
-                                        # find the file that was changed in the modification we are at
-                                        if m.old_path in f:
-
-                                            # grab the sourcecode and save it: before without comments, before with comments, and after with comments
-                                            if not (
-                                                "source" in data[r][c]["files"][f]
-                                                and (
-                                                    len(
-                                                        data[r][c]["files"][f]["source"]
-                                                    )
-                                                    > 0
-                                                )
-                                            ):
-                                                sourcecode = (
-                                                    "\n"
-                                                    + myutils.removeDoubleSeperatorsString(
-                                                        myutils.stripComments(
-                                                            m.source_code_before
-                                                        )
-                                                    )
-                                                )
-                                                data[r][c]["files"][f][
-                                                    "source"
-                                                ] = sourcecode
-
-                                            if not (
-                                                "sourceWithComments"
-                                                in data[r][c]["files"][f]
-                                                and (
-                                                    len(
-                                                        data[r][c]["files"][f][
-                                                            "sourceWithComments"
-                                                        ]
-                                                    )
-                                                    > 0
-                                                )
-                                            ):
-                                                data[r][c]["files"][f][
-                                                    "sourceWithComments"
-                                                ] = m.source_code_before
-
-                                            if not (
-                                                "sourceWithComments"
-                                                in data[r][c]["files"][f]
-                                                and (
-                                                    len(
-                                                        data[r][c]["files"][f][
-                                                            "sourceWithComments"
-                                                        ]
-                                                    )
-                                                    > 0
-                                                )
-                                            ):
-                                                data[r][c]["files"][f][
-                                                    "sourcecodeafter"
-                                                ] = ""
-                                                if m.source_code is not None:
-                                                    data[r][c]["files"][f][
-                                                        "sourcecodeafter"
-                                                    ] = m.source_code
-
-                                            if not r in datanew:
-                                                datanew[r] = {}
-                                            if not c in datanew[r]:
-                                                datanew[r][c] = {}
-
-                                            # save it in the new dataset
-                                            datanew[r][c] = data[r][c]
-                                            print("     ->> added to the dataset.")
-
-            except Exception as e:
-                print("Exception occured.")
-                print(e)
-                time.sleep(2)
+        if change_found:
+            # For each file, if "source" and "sourceWithComments" are empty, try to fill them.
+            for f in commit_obj["files"]:
+                if not commit_obj["files"][f].get("source", "").strip():
+                    # Fallback: use the overall diff as a source (may be crude, but provides content)
+                    commit_obj["files"][f]["source"] = commit_obj.get("diff", "")
+                if not commit_obj["files"][f].get("sourceWithComments", "").strip():
+                    commit_obj["files"][f]["sourceWithComments"] = commit_obj.get("diff", "")
+            if "msg" not in commit_obj:
+                commit_obj["msg"] = commit_obj["message"]
+            sha = commit_obj.get("sha", commit_obj.get("commit", None))
+            if not sha:
                 continue
+            commit_obj["sha"] = sha
 
-    print("done.")
-    print(len(data))
+            # Insert into final_data using repo as key and commit SHA as sub-key.
+            if repo not in final_data:
+                final_data[repo] = {}
+            final_data[repo][sha] = commit_obj
+            print("Added commit", sha, "from repo", repo)
 
-    # save dataset
-    with open("data/plain_" + mode, "w") as outfile:
-        json.dump(datanew, outfile)
+print("Done processing. Total commits processed:",
+      sum(len(commits) for commits in final_data.values()))
+
+# Save the final output (dict of dicts) to file.
+with open("data/plain_" + mode, "w") as outfile:
+    json.dump(final_data, outfile)
