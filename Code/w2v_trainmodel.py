@@ -39,6 +39,7 @@ print("processed.\n")
 # for mincount in [10,30,50,100,300,500,5000]:
 #   for iterationen in [1,5,10,30,50,100]:
 #     for s in [5,10,15,30,50,75,100,200,300]:
+
 for mincount in [10]:
   for iterationen in [50]:
     for s in [50]:
@@ -56,21 +57,6 @@ for mincount in [10]:
         model = Word2Vec(all_words, vector_size=s, min_count=mincount, epochs=iterationen, workers = 4)  
         vocabulary = model.wv.key_to_index
 
-        #print some examples
-        
-        #words = ["import", "true", "while", "if", "try", "in", "+", "x", "=", ":", "[", "print", "str", "count", "len", "where", "join", "split", "==", "raw_input"]
-        #for similar in words:
-        #  try:
-        #    print("\n")
-        #    print(similar)
-        #    sim_words = model.wv.most_similar(similar)  
-        #    print(sim_words)
-        #    print("\n")
-        #  except Exception as e:
-        #    print(e)
-        #    print("\n")
-
-        #saving the model
         model.save(fname)
 
 

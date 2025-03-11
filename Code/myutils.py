@@ -1,9 +1,7 @@
 import re
 import os
-import builtins
-import keyword
 import pickle
-import numpy
+import numpy as np
 from keras.preprocessing import sequence
 from keras import backend as K
 import tensorflow as tf
@@ -11,38 +9,25 @@ from gensim.models import Word2Vec, KeyedVectors
 from PIL import Image, ImageDraw, ImageFont
 from termcolor import colored
 
-###########################
-# COMMENT HANDLING FUNCTIONS
-###########################
+vulnerability_indicators_map = {
+    "dos": ["sleep", "kill", "fork", "exit"],
+    "overflow": ["strcpy", "gets", "sprintf"],
+    "infor": ["printf", "snprintf"],
+    "bypass": ["memcmp", "strcmp"],
+    "priv escalation & execution": ["system", "exec", "popen"]
+}
+
 
 def findComments(sourcecode):
-    """
-    Find comment areas in C code (both single-line and block comments).
-    Returns a list of [start, end] positions.
-    """
     pattern = re.compile(r'//.*?$|/\*.*?\*/', re.DOTALL | re.MULTILINE)
-    commentareas = []
-    for match in pattern.finditer(sourcecode):
-        commentareas.append([match.start(), match.end()])
-    return commentareas
+    return [[m.start(), m.end()] for m in pattern.finditer(sourcecode)]
 
 def stripComments(code):
-    """
-    Removes all C-style comments from code.
-    """
     pattern = re.compile(r'//.*?$|/\*.*?\*/', re.DOTALL | re.MULTILINE)
     return re.sub(pattern, '', code)
 
-###########################
-# POSITION FINDING FUNCTIONS
-###########################
-
 def findposition(badpart, sourcecode):
-    """
-    Attempts to locate the position (start and end indices) of a given badpart string in the sourcecode,
-    ignoring text inside C comments.
-    Returns [start, end] if found, else [-1, -1].
-    """
+
     splitchars = ["\t", "\n", " ", ".", ":", "(", ")", "[", "]", "<", ">", "+", "-", "=",
                   "\"", "\'", "*", "/", "\\", "~", "{", "}", "!", "?", ";", ",", "%", "&"]
     pos = 0
@@ -51,72 +36,51 @@ def findposition(badpart, sourcecode):
     in_block_comment = False
     startfound = -1
     endfound = -1
-    end = False
 
     badpart = badpart.lstrip()
-    if len(badpart) < 1:
+    if not badpart:
         return [-1, -1]
 
-    while not end:
-        if pos >= len(sourcecode):
-            end = True
-            break
-
-        # Check for start of comments:
+    while pos < len(sourcecode):
+        # Check for comment start markers
         if sourcecode[pos:pos+2] == "//":
             in_line_comment = True
         if sourcecode[pos:pos+2] == "/*":
             in_block_comment = True
 
-        # End line comment at newline.
+        # End comments appropriately
         if in_line_comment and sourcecode[pos] == "\n":
             in_line_comment = False
-        # End block comment when encountering "*/"
         if in_block_comment and sourcecode[pos:pos+2] == "*/":
             in_block_comment = False
             pos += 2
             continue
 
-        # If in any comment, skip this character.
+        # Skip characters within comments
         if in_line_comment or in_block_comment:
             pos += 1
             continue
 
-        # Skip extra whitespace (similar to original logic)
-        if sourcecode[pos] == "\n" and pos > 0 and sourcecode[pos-1] in ["\n", " "]:
-            pos += 1
-            continue
-        if sourcecode[pos] == " " and pos > 0 and sourcecode[pos-1] == " ":
-            pos += 1
-            continue
-
-        # Matching logic: if current character matches badpart[matchindex]
+        # Match the badpart character by character
         if sourcecode[pos] == badpart[matchindex]:
             if matchindex == 0:
                 startfound = pos
             matchindex += 1
             if matchindex == len(badpart):
                 endfound = pos
-                break
+                return [startfound, endfound]
         else:
-            # Reset match if a mismatch occurs
             matchindex = 0
             startfound = -1
 
         pos += 1
 
-    if startfound == -1 or endfound == -1:
-        return [-1, -1]
-    return [startfound, endfound]
+    return [-1, -1]
 
 def findpositions(badparts, sourcecode):
-    """
-    For each badpart in badparts, determine its position in sourcecode.
-    Returns a list of [start, end] positions (only those with valid positions).
-    """
+ 
     positions = []
     for bad in badparts:
-        # Remove any trailing comment markers from bad (if any)
         if "#" in bad:
             bad = bad.split("#")[0]
         pos = findposition(bad, sourcecode)
@@ -147,34 +111,22 @@ def getcontextPos(sourcecode, focus, fulllength):
     endcontext = focus
     if focus >= len(sourcecode):
         return None
-
     toggle = True
     while len(sourcecode[startcontext:endcontext]) < fulllength:
-        if previoussplit(sourcecode, startcontext) == -1 and nextsplit(sourcecode, endcontext) == -1:
+        prev = previoussplit(sourcecode, startcontext)
+        nxt = nextsplit(sourcecode, endcontext)
+        if prev == -1 and nxt == -1:
             return None
-        if toggle and previoussplit(sourcecode, startcontext) > -1:
-            startcontext = previoussplit(sourcecode, startcontext)
-        elif not toggle and nextsplit(sourcecode, endcontext) > -1:
-            endcontext = nextsplit(sourcecode, endcontext)
+        if toggle and prev > -1:
+            startcontext = prev
+        elif not toggle and nxt > -1:
+            endcontext = nxt
         toggle = not toggle
     return [startcontext, endcontext]
 
 def getcontext(sourcecode, focus, fulllength):
-    startcontext = focus
-    endcontext = focus
-    if focus >= len(sourcecode):
-        return None
-
-    toggle = True
-    while len(sourcecode[startcontext:endcontext]) < fulllength:
-        if previoussplit(sourcecode, startcontext) == -1 and nextsplit(sourcecode, endcontext) == -1:
-            return None
-        if toggle and previoussplit(sourcecode, startcontext) > -1:
-            startcontext = previoussplit(sourcecode, startcontext)
-        elif not toggle and nextsplit(sourcecode, endcontext) > -1:
-            endcontext = nextsplit(sourcecode, endcontext)
-        toggle = not toggle
-    return sourcecode[startcontext:endcontext]
+    pos = getcontextPos(sourcecode, focus, fulllength)
+    return sourcecode[pos[0]:pos[1]] if pos else None
 
 def getblocks(sourcecode, badpositions, step, fulllength):
     blocks = []
@@ -193,9 +145,9 @@ def getblocks(sourcecode, badpositions, step, fulllength):
                                     (context[0] <= bp[0] and context[1] >= bp[1])
                                     for bp in badpositions)
                 label = 0 if vulnerablePos else 1
-                singleblock = [sourcecode[context[0]:context[1]], label]
-                if not any(b[0] == singleblock[0] for b in blocks):
-                    blocks.append(singleblock)
+                block_snippet = sourcecode[context[0]:context[1]]
+                if not any(b[0] == block_snippet for b in blocks):
+                    blocks.append([block_snippet, label])
         if "\n" in sourcecode[focus+1:focus+7]:
             lastfocus = focus
             newline_index = sourcecode[focus+1:focus+7].find("\n")
@@ -213,65 +165,36 @@ def getblocks(sourcecode, badpositions, step, fulllength):
                     break
     return blocks
 
-###########################
-# DIFF-PARSING FUNCTIONS
-###########################
-
 def getBadpart(change):
-    """
-    Parse a diff string and return a two-element list:
-      [list of removed lines (bad examples), list of added lines (good examples)]
-    Returns None if no significant removal lines are found.
-    """
     lines = change.split("\n")
-    # Check if any line (after stripping) starts with a removal marker
     if not any(line.lstrip().startswith("-") for line in lines):
         return None
 
     badexamples = []
     goodexamples = []
-    
     for line in lines:
         stripped_line = line.strip()
         if len(stripped_line) <= 1:
-            continue  # Skip trivial or empty lines
+            continue
         if stripped_line.startswith("-"):
             content = stripped_line[1:].strip()
-            # Skip trivial content such as only braces or semicolons.
             if content and content not in ["{", "}", "};", ";"]:
                 badexamples.append(content)
         elif stripped_line.startswith("+"):
             content = stripped_line[1:].strip()
             if content and content not in ["{", "}", "};", ";"]:
                 goodexamples.append(content)
-    
     if not badexamples:
         return None
     return [badexamples, goodexamples]
 
-
-def getTokens(change):
-    # Clean up spacing around punctuation
-    for old, new in [(" .", "."), (" ,", ","), (" )", ")"), (" (", "("),
-                     (" ]", "]"), (" [", "["), (" {", "{"), (" }", "}"),
-                     (" :", ":"), ("- ", "-"), ("+ ", "+"), (" =", "="), ("= ", "=")]:
-        change = change.replace(old, new)
-    splitchars = [" ", "\t", "\n", ".", ":", "(", ")", "[", "]", "<", ">", "+", "-", "=",
-                  "\"", "\'", "*", "/", "\\", "~", "{", "}", "!", "?", ";", ",", "%", "&"]
-    tokens = []
-    start = 0
-    for i in range(len(change)):
-        if change[i] in splitchars:
-            if i > start:
-                token = change[start:i]
-                if token:
-                    tokens.append(token)
-            tokens.append(change[i])
-            start = i
+def getTokens(code):
+    tokens = re.findall(r'\w+|[^\s\w]', code, re.UNICODE)
     return tokens
 
 def removeDoubleSeperatorsString(string):
-    return "".join(removeDoubleSeperators(getTokens(string)))
+    tokens = getTokens(string)
+    return "".join(removeDoubleSeperators(tokens))
 
 def removeDoubleSeperators(tokenlist):
     newtokens = []
@@ -287,17 +210,12 @@ def removeDoubleSeperators(tokenlist):
 
 def isEmpty(code):
     tokens = getTokens(stripComments(code))
-    for t in tokens:
-        if t not in ["\n", " "]:
-            return False
-    return True
+    return all(t in ["\n", " "] for t in tokens)
 
 def is_builtin(name):
-    # For C, there is no direct equivalent to Python builtins.
     return False
 
 def is_keyword(name):
-    # Define a set of common C keywords.
     c_keywords = {"auto", "break", "case", "char", "const", "continue", "default", "do", 
                   "double", "else", "enum", "extern", "float", "for", "goto", "if", "inline", 
                   "int", "long", "register", "restrict", "return", "short", "signed", "sizeof", 
@@ -318,22 +236,17 @@ def removeTripleN(tokenlist):
     return newtokens
 
 def getgoodblocks(sourcecode, goodpositions, fulllength):
-    """
-    Extracts blocks from safe code portions.
-    Returns a list of blocks, where each block is [code snippet, label=1].
-    """
     blocks = []
     if goodpositions:
         for pos in goodpositions:
-            # Ensure pos is valid and nonempty
             if pos and pos[0] < pos[1]:
                 focus = pos[0]
                 while focus < pos[1]:
                     context = getcontext(sourcecode, focus, fulllength)
                     if context and context.strip():
-                        singleblock = [context, 1]
-                        if not any(b[0] == singleblock[0] for b in blocks):
-                            blocks.append(singleblock)
+                        block_snippet = context
+                        if not any(b[0] == block_snippet for b in blocks):
+                            blocks.append([block_snippet, 1])
                     ns = nextsplit(sourcecode, focus + 15)
                     if ns > -1 and ns < pos[1]:
                         focus = ns
@@ -341,21 +254,20 @@ def getgoodblocks(sourcecode, goodpositions, fulllength):
                         break
     return blocks
 
-###########################
-# LOSS, PREDICTION, VISUALIZATION
-###########################
 
 def f1_loss(y_true, y_pred):
-    # Cast both y_true and y_pred to float32
+    """
+    Custom F1 loss function.
+    """
     y_true = K.cast(y_true, 'float32')
     y_pred = K.cast(y_pred, 'float32')
     tp = K.sum(y_true * y_pred, axis=0)
     tn = K.sum((1 - y_true) * (1 - y_pred), axis=0)
     fp = K.sum((1 - y_true) * y_pred, axis=0)
     fn = K.sum(y_true * (1 - y_pred), axis=0)
-    p = tp / (tp + fp + K.epsilon())
-    r = tp / (tp + fn + K.epsilon())
-    f1 = 2 * p * r / (p + r + K.epsilon())
+    precision = tp / (tp + fp + K.epsilon())
+    recall = tp / (tp + fn + K.epsilon())
+    f1 = 2 * precision * recall / (precision + recall + K.epsilon())
     f1 = tf.where(tf.math.is_nan(f1), tf.zeros_like(f1), f1)
     return 1 - K.mean(f1)
 
@@ -363,33 +275,28 @@ def f1(y_true, y_pred):
     y_true = K.cast(y_true, 'float32')
     y_pred = K.cast(y_pred, 'float32')
     def recall(y_true, y_pred):
-        true_positives = K.sum(K.round(K.clip(y_true * y_pred, 0, 1)))
+        tp = K.sum(K.round(K.clip(y_true * y_pred, 0, 1)))
         possible_positives = K.sum(K.round(K.clip(y_true, 0, 1)))
-        return true_positives / (possible_positives + K.epsilon())
+        return tp / (possible_positives + K.epsilon())
     def precision(y_true, y_pred):
-        true_positives = K.sum(K.round(K.clip(y_true * y_pred, 0, 1)))
+        tp = K.sum(K.round(K.clip(y_true * y_pred, 0, 1)))
         predicted_positives = K.sum(K.round(K.clip(y_pred, 0, 1)))
-        return true_positives / (predicted_positives + K.epsilon())
+        return tp / (predicted_positives + K.epsilon())
     prec = precision(y_true, y_pred)
     rec = recall(y_true, y_pred)
     return 2 * ((prec * rec) / (prec + rec + K.epsilon()))
 
 def predict(vectorlist, model):
     if vectorlist:
-        one = numpy.array([vectorlist])
+        one = np.array([vectorlist])
         max_length = 200
         one = sequence.pad_sequences(one, maxlen=max_length)
         yhat_probs = model.predict(one, verbose=0)
-        prediction = int(yhat_probs[0][0] * 100000) * 0.00001
-        return prediction
+        return float(yhat_probs[0][0])
     else:
         return -1
 
-# (Optional) getblocksVisual and dataset retrieval functions remain largely unchanged,
-# but you can update them further if your C-code visualization needs differ.
-
 def getIdentifiers(mode, nr):
-    # This function remains unchanged.
     if mode == "sql":
         if nr == "1":
             rep = "instacart/lore"
@@ -403,9 +310,7 @@ def getIdentifiers(mode, nr):
             rep = "onewyoming/onewyoming"
             com = "54fc7b076fda2de74eeb55e6b75b28e09ef231c2"
             myfile = "/experimental/python/buford/model/visitor.py"
-    # Additional modes follow...
-    result = [rep, com, myfile]
-    return result
+    return [rep, com, myfile]
 
 def getFromDataset(identifying, data):
     result = []
@@ -440,157 +345,97 @@ def getFromDataset(identifying, data):
                                     result.append(allbadparts)
                                     return result
     if not repfound:
-        print("Rep found", repfound)
+        print("Repository not found:", rep)
     elif not comfound:
-        print("Com found", comfound)
+        print("Commit not found:", com)
     elif not filefound:
-        print("File found", filefound)
+        print("File not found:", myfile)
     return []
 
-def getblocksVisual(mode, sourcecode, badpositions, commentareas, fulllength, step, nr, w2v_model, model, threshold, name):
-    from PIL import Image, ImageDraw, ImageFont
-    import os
-
-    # Create a transparent image (RGBA with full transparency)
-    def create_transparent_image(width, height):
-        return Image.new('RGBA', (width, height), (255, 255, 255, 0))
-    
-    # Load default font and measure text using getbbox()
-    font = ImageFont.load_default()
-    def get_text_size(text):
-        if not text:
-            return (0, 0)
-        bbox = font.getbbox(text)
-        width = bbox[2] - bbox[0]
-        height = bbox[3] - bbox[1]
-        return (width, height)
-    
-    word_vectors = w2v_model.wv
-
-    # Estimate image dimensions based on the number of lines in the source code.
-    lines = sourcecode.count("\n") + 1
-    base_line_height = get_text_size("A")[1] or 12
-    img_height = (base_line_height + 5) * lines + 50  # some padding
-    img_width = 2000
-
-    img = create_transparent_image(img_width, img_height)
-    draw = ImageDraw.Draw(img)
-
-    xpos, ypos = 0, 0
-    focus, lastfocus = 0, 0
-
-    # Process the source code in segments
-    while True:
-        if focus > len(sourcecode):
-            break
-
-        # Adjust focus based on comment areas
-        comment = False
-        for com in commentareas:
-            if (focus >= com[0] and focus <= com[1] and lastfocus >= com[0] and lastfocus < com[1]):
-                focus = com[1]
-                comment = True
-            elif (focus > com[0] and focus <= com[1] and lastfocus < com[0]):
-                focus = com[0]
-                comment = False
-            elif (lastfocus >= com[0] and lastfocus < com[1] and focus > com[1]):
-                focus = com[1]
-                comment = True
-
-        segment = sourcecode[lastfocus:focus]
-        if not segment:
-            if focus < len(sourcecode):
-                lastfocus = focus
-                focus += step
-            else:
-                break
-            continue
-
-        # Default color assignment
-        seg_color = "grey" if comment else "black"
-        p = -1  # model's predicted probability for the current segment
-        vulnerablePos = False
-
-        # If not in a comment, try to compute a prediction
-        if not comment:
-            middle = lastfocus + round(0.5 * (focus - lastfocus))
-            context = getcontextPos(sourcecode, middle, fulllength)
-            if context is not None:
-                # Determine if the context overlaps any vulnerable region
-                vulnerablePos = any(
-                    (context[0] > bp[0] and context[0] <= bp[1]) or
-                    (context[1] > bp[0] and context[1] <= bp[1]) or
-                    (context[0] <= bp[0] and context[1] >= bp[1])
-                    for bp in badpositions
-                )
-                text_segment = sourcecode[context[0]:context[1]].replace("\n", " ")
-                token = getTokens(text_segment)
-                vectorlist = []
-                for t in token:
-                    if t in word_vectors.key_to_index and t.strip():
-                        vectorlist.append(word_vectors[t].tolist())
-                if vectorlist:
-                    p = predict(vectorlist, model)  # original probability (likely near 1.0)
-                    # Calibrate the probability (subtract an offset to counter overprediction)
-                    calibration_offset = 0.2
-                    adjusted_p = p - calibration_offset
-                    if adjusted_p < 0:
-                        adjusted_p = 0.0
-                    # Print debug info showing both original and adjusted probabilities.
-                    print(f"[DEBUG] Snippet => p={p:.4f}, adjusted_p={adjusted_p:.4f}, Vulnerable? {vulnerablePos}")
-                    
-                    # Revised color logic based on adjusted probability:
-                    if vulnerablePos:
-                        if adjusted_p > 0.5:
-                            seg_color = "red"      # True Positive
-                        else:
-                            seg_color = "orange"   # False Negative
-                    else:
-                        if adjusted_p > 0.5:
-                            seg_color = "purple"   # False Positive
-                        else:
-                            seg_color = "green"    # True Negative
-                    print(f"       => Marking color {seg_color}.")
-        
-        # Draw the segment on the image; split by newline to avoid breaking a single line arbitrarily.
-        segment_lines = segment.split("\n")
-        for idx, line_text in enumerate(segment_lines):
-            if idx > 0:
-                xpos = 0
-                text_w, text_h = get_text_size(line_text)
-                ypos += text_h if text_h > 0 else base_line_height
-            if line_text:
-                draw.text((xpos, ypos), line_text, fill=seg_color, font=font)
-                text_w, _ = get_text_size(line_text)
-                xpos += text_w
-        # After drawing the segment, reset xpos and move down one line.
-        xpos = 0
-        ypos += base_line_height
-
-        # Update focus indices: use newline in the upcoming text or nextsplit()
-        if "\n" in sourcecode[focus+1:focus+7]:
-            newline_index = sourcecode[focus+1:focus+7].find("\n")
-            lastfocus = focus
-            focus = focus + newline_index + 1
+def get_colors(p, vulnerablePos, threshold, text_segment):
+    if vulnerablePos:
+        if p > 0.5:
+            pil_color = "royalblue"
+            console_text = colored(text_segment, 'cyan')
         else:
-            next_pos = nextsplit(sourcecode, focus + step)
-            if next_pos > -1:
-                lastfocus = focus
-                focus = next_pos
-            else:
-                if focus < len(sourcecode):
-                    lastfocus = focus
-                    focus = len(sourcecode)
-                else:
-                    break
+            pil_color = "violet"
+            console_text = colored(text_segment, 'magenta')
+    else:
+        if p > threshold[0]:
+            pil_color = "darkred"
+        elif p > threshold[1]:
+            pil_color = "red"
+        elif p > threshold[2]:
+            pil_color = "darkorange"
+        elif p > threshold[3]:
+            pil_color = "orange"
+        elif p > threshold[4]:
+            pil_color = "gold"
+        elif p > threshold[5]:
+            pil_color = "yellow"
+        elif p > threshold[6]:
+            pil_color = "LightBlue"
+        elif p > threshold[7]:
+            pil_color = "SkyBlue"
+        elif p > threshold[8]:
+            pil_color = "Blue"
+        else:
+            pil_color = "DarkBlue"
 
-    # Save the resulting image with a unique filename.
+        if p > 0.8:
+            console_text = colored(text_segment, 'red')
+        elif p > 0.5:
+            console_text = colored(text_segment, 'yellow')
+        else:
+            console_text = colored(text_segment, 'blue')
+
+    return pil_color, console_text
+
+def is_line_vulnerable(line, mode):
+    indicators = vulnerability_indicators_map.get(mode.lower(), [])
+    for keyword in indicators:
+        if keyword in line:
+            simulated_diff = "- " + line
+            if getBadpart(simulated_diff) is not None:
+                return True
+    return False
+
+
+def getblocksVisualLineByLine(mode, sourcecode, w2v_model, model, threshold, max_length=100):
+    font = ImageFont.load_default()
+    lines = sourcecode.splitlines()
+
+    sample_bbox = font.getbbox("A")
+    line_height = (sample_bbox[3] - sample_bbox[1]) if sample_bbox else 12
+    img_height = (line_height + 4) * len(lines) + 50
+    img_width = 1000
+
+    img = Image.new('RGBA', (img_width, img_height), (255, 255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    y_offset = 0
+    for line in lines:
+        vulnerablePos = is_line_vulnerable(line, mode)
+        tokens = line.split()
+        vectorlist = []
+        for token in tokens:
+            if token in w2v_model.wv.key_to_index:
+                vectorlist.append(w2v_model.wv[token].tolist())
+
+        p = 0.0
+        if vectorlist:
+            arr = np.array([vectorlist])
+            arr = sequence.pad_sequences(arr, maxlen=max_length, dtype='float32')
+            yhat_probs = model.predict(arr, verbose=0)
+            p = float(yhat_probs[0][0])
+
+        pil_color, console_text = get_colors(p, vulnerablePos, threshold, line)
+        print(console_text + f"  (p={p:.3f})")
+        draw.text((0, y_offset), line, fill=pil_color, font=font)
+        y_offset += line_height + 4
+
     for i in range(1, 100):
-        filename = f"demo_{mode}_{i}_{name}.png"
+        filename = f"demo/demo_{mode}_{i}.png"
         if not os.path.isfile(filename):
             img.save(filename)
             print(f"Saved PNG: {filename}")
             break
-
-    return []
-
