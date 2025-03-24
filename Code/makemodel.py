@@ -140,7 +140,7 @@ val_gen = DataGenerator(X_val, ValidateY, batch_size=32)
 # Enhanced hyperparameters
 dropout = 0.3
 neurons = 128
-epochs = 100
+epochs = 10
 batchsize = 32
 
 # Create a more complex model

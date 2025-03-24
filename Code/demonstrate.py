@@ -6,13 +6,8 @@ from keras.models import load_model
 from gensim.models import Word2Vec
 
 def main():
-    # Default parameters
+    # Default parameters - set overflow as default mode to catch buffer overflow issues
     mode = "dos"
-    # mode = "overflow"
-    # mode = "info"
-    # mode = "bypass"
-    # mode = "priv"
-    
     nr = "1"
     fine = ""
     
@@ -30,6 +25,7 @@ def main():
     
     nowformat = datetime.now().strftime("%H:%M")
     print("Current time:", nowformat)
+    print(f"Analyzing for {mode} vulnerabilities...")
     
     # Load the Word2Vec model
     mincount = 10
@@ -42,23 +38,59 @@ def main():
         sys.exit(1)
     w2v_model = Word2Vec.load(w2vmodel_path)
     
-    # Load the trained LSTM model
-    lstm_model_path = os.path.join("model", "LSTM_model_" + mode + ".h5")
-    if not os.path.exists(lstm_model_path):
-        print("LSTM model not found at", lstm_model_path)
+    # Try to load the enhanced model first, fall back to the original if not available
+    model_paths = [
+        os.path.join("model", f"enhanced_LSTM_attention_model_{mode}.h5"),
+        os.path.join("model", f"enhanced_LSTM_model_{mode}.h5"),
+        os.path.join("model", f"LSTM_model_{mode}.h5")
+    ]
+    
+    model = None
+    for model_path in model_paths:
+        if os.path.exists(model_path):
+            print(f"Loading model from {model_path}")
+            try:
+                model = load_model(model_path, custom_objects={'f1_loss': myutils.f1_loss, 'f1': myutils.f1})
+                break
+            except Exception as e:
+                print(f"Error loading model {model_path}: {e}")
+                continue
+    
+    if model is None:
+        print("No suitable LSTM model found.")
         sys.exit(1)
-    model = load_model(lstm_model_path, custom_objects={'f1_loss': myutils.f1_loss, 'f1': myutils.f1})
     
     # Read the example C source file for demonstration
-    example_file = os.path.join("examples", mode + "_1.c")
+    example_file = os.path.join("examples", f"{mode}_{nr}.c")
     if not os.path.exists(example_file):
-        print("Example file not found at", example_file)
-        sys.exit(1)
+        print(f"Example file not found at {example_file}. Checking for generic file...")
+        # Try without specifying mode
+        generic_file = os.path.join("examples", f"example_{nr}.c")
+        if os.path.exists(generic_file):
+            example_file = generic_file
+        else:
+            # Look for any C file with the vulnerability type in its name
+            for file in os.listdir("examples"):
+                if file.endswith(".c") and (mode in file or "vulnerability" in file):
+                    example_file = os.path.join("examples", file)
+                    print(f"Found alternative file: {example_file}")
+                    break
+            else:
+                print("No suitable example file found.")
+                sys.exit(1)
+    
     with open(example_file, 'r') as infile:
         sourcecodefull = infile.read()
     
-    # Call the visualization function, passing the current mode so that vulnerability detection is mode-specific
-    myutils.getblocksVisualLineByLine(mode, sourcecodefull, w2v_model, model, threshold)
+    print(f"Analyzing file: {example_file}")
+    
+    
+    print(f"Using detection mode: {mode}")
+    
+
+    
+    # Call the word-by-word visualization function
+    myutils.getblocksVisualWordByWord(mode, sourcecodefull, w2v_model, model, threshold)
     
 if __name__ == "__main__":
     main()

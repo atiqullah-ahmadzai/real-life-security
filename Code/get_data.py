@@ -94,15 +94,39 @@ def process_commits(raw_data, mode):
     now = datetime.now()
     print("Finished loading at", now.strftime("%H:%M"))
 
+    # Mapping of modes to vulnerability types
+    vulnerability_map = {
+        "dos": "DoS",
+        "overflow": "Overflow",
+        "info": "+Info",
+        "bypass": "Bypass",
+        "priv": "+Priv"
+    }
+    
+    # Get the exact vulnerability type string to match
+    vuln_type = vulnerability_map.get(mode.lower(), mode)
+    print(f"Filtering for vulnerability type: {vuln_type}")
+
     # Filtering keywords
     suspiciouswords = ["injection", "vulnerability", "exploit", " ctf",
-                       "capture the flag", "ctf", "burp", "capture", "flag", "attack", "hack"]
+                      "capture the flag", "ctf", "burp", "capture", "flag", "attack", "hack"]
     badwords = ["overflow", "buffer", "stack", "heap", "format", "dos", "arbitrary", "injection"]
 
     final_data = {}
+    sample_count = 0
+    max_samples = 50
+    
+    print(f"Collecting up to {max_samples} vulnerable samples...")
+    
     for repo, commit_list in grouped_data.items():
+        if sample_count >= max_samples:
+            break
+            
         for commit_obj in commit_list:
-            if "vulnerability" not in commit_obj or mode.lower() not in commit_obj["vulnerability"].lower():
+            if sample_count >= max_samples:
+                break
+                
+            if "vulnerability" not in commit_obj or vuln_type not in commit_obj["vulnerability"]:
                 continue
             if "diff" not in commit_obj or not any(ext in commit_obj["diff"].lower() for ext in [".c", ".cpp", ".cc"]):
                 continue
@@ -114,6 +138,7 @@ def process_commits(raw_data, mode):
 
             changes = get_changes(commit_obj["diff"])
             change_found = False
+            has_valid_vulnerability = False
 
             # Ensure files field is a dictionary
             if "files" not in commit_obj or not isinstance(commit_obj["files"], dict):
@@ -126,11 +151,25 @@ def process_commits(raw_data, mode):
                     if f is not None:
                         if any(s.lower() in f.lower() for s in suspiciouswords):
                             continue
+                            
+                        # Validate that the sample contains actual bad parts
+                        if thischange["badparts"] and len(thischange["badparts"]) > 0:
+                            # Analyze the bad parts to confirm vulnerability
+                            print(f"Analyzing vulnerability in {f}...")
+                            print(f"Bad parts found: {len(thischange['badparts'])}")
+                            
+                            # Validate at least one clear bad part exists
+                            for bad_part in thischange["badparts"]:
+                                if bad_part and len(bad_part.strip()) > 5:  # Ensure non-trivial bad part
+                                    has_valid_vulnerability = True
+                                    print(f"Found vulnerable code: {bad_part[:50]}{'...' if len(bad_part) > 50 else ''}")
+                                    break
+                                    
                         commit_obj["files"].setdefault(f, {}) \
                                           .setdefault("changes", []).append(thischange)
                         change_found = True
 
-            if change_found:
+            if change_found and has_valid_vulnerability:
                 # Ensure source code is available in file data
                 for f in commit_obj["files"]:
                     if not commit_obj["files"][f].get("source", "").strip():
@@ -144,10 +183,19 @@ def process_commits(raw_data, mode):
                     continue
                 commit_obj["sha"] = sha
                 final_data.setdefault(repo, {})[sha] = commit_obj
-                print("Added commit", sha, "from repo", repo)
+                sample_count += 1
+                print(f"Added commit {sha} from repo {repo} - Sample {sample_count}/{max_samples}")
+    
+    print(f"Successfully collected {sample_count} vulnerable samples")
     return final_data
 
 def main():
+    # Available modes and what they filter for:
+    # "dos" - Filter for "DoS" vulnerabilities (1110 commits)
+    # "overflow" - Filter for "Overflow" vulnerabilities (206 commits)
+    # "info" - Filter for "+Info" vulnerabilities (290 commits)
+    # "bypass" - Filter for "Bypass" vulnerabilities (199 commits)
+    # "priv" - Filter for "+Priv" vulnerabilities (124 commits)
     mode = "dos"
     #mode = "overflow"
     #mode = "info"
@@ -157,7 +205,7 @@ def main():
     if len(sys.argv) > 1:
         mode = sys.argv[1]
     try:
-        with open("github/c_commits_with_diffs_sample.json", "r") as infile:
+        with open("github/c_commits_with_diffs.json", "r") as infile:
             raw_data = json.load(infile)
     except Exception as e:
         print("Error loading JSON file:", e)
